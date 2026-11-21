@@ -44,7 +44,7 @@ export interface InputOptions {
 
 export class InputController {
   options: InputOptions = { stylusOnly: false, panMode: false, smoothing: 0, palmMs: 500, tapMs: 300, tapSlop: 10 };
-  private stroke?: { id: number; kind: PointerKind; x: number; y: number; pressure: number };
+  private stroke?: { id: number; kind: PointerKind; x: number; y: number; pressure: number; rawX: number; rawY: number };
   private panPointer?: { id: number; x: number; y: number };
   private touches = new Map<number, { x: number; y: number; startX: number; startY: number }>();
   private tap?: { start: number; max: number; moved: boolean };
@@ -65,7 +65,8 @@ export class InputController {
     const stroke = this.stroke;
     if (!stroke) return;
     this.stroke = undefined;
-    if (keepInk && stroke.kind !== 'touch') this.handlers.strokeEnd?.({ x: stroke.x, y: stroke.y, pressure: stroke.pressure, time: Date.now(), kind: stroke.kind });
+    // Keep every sampled position: finish at the last raw sample, not the smoothed one.
+    if (keepInk && stroke.kind !== 'touch') this.handlers.strokeEnd?.({ x: stroke.rawX, y: stroke.rawY, pressure: stroke.pressure, time: Date.now(), kind: stroke.kind });
     else this.handlers.strokeCancel?.();
   }
   reset() { this.interrupt(false); this.touches.clear(); this.tap = undefined; this.pinchStart = undefined; this.panPointer = undefined; }
@@ -77,6 +78,7 @@ export class InputController {
 
   private smoothed(event: RawPointer) {
     const s = this.stroke!, k = Math.min(0.95, this.options.smoothing), pressure = this.normalisedPressure(event);
+    s.rawX = event.x; s.rawY = event.y;
     s.x += (event.x - s.x) * (1 - k); s.y += (event.y - s.y) * (1 - k); s.pressure += (pressure - s.pressure) * (1 - k * 0.5);
     return { x: s.x, y: s.y, pressure: s.pressure, time: event.time, kind: s.kind };
   }
@@ -88,7 +90,7 @@ export class InputController {
       if (event.kind === 'pen' && this.stroke?.kind === 'touch') this.interrupt(false);
       if (middle || this.options.panMode) { this.panPointer = { id: event.id, x: event.x, y: event.y }; return; }
       if (event.button !== undefined && event.button > 1) return;
-      this.stroke = { id: event.id, kind: event.kind, x: event.x, y: event.y, pressure: this.normalisedPressure(event) };
+      this.stroke = { id: event.id, kind: event.kind, x: event.x, y: event.y, rawX: event.x, rawY: event.y, pressure: this.normalisedPressure(event) };
       this.handlers.strokeBegin?.({ x: event.x, y: event.y, pressure: this.stroke.pressure, time: event.time, kind: event.kind });
       return;
     }
@@ -125,7 +127,7 @@ export class InputController {
         return;
       }
       if (this.touches.size === 1 && !this.options.stylusOnly && !this.options.panMode) {
-        this.stroke = { id: event.id, kind: 'touch', x: event.x, y: event.y, pressure: 1 };
+        this.stroke = { id: event.id, kind: 'touch', x: event.x, y: event.y, rawX: event.x, rawY: event.y, pressure: 1 };
         this.handlers.strokeBegin?.({ x: event.x, y: event.y, pressure: 1, time: now, kind: 'touch' });
       }
       return;
