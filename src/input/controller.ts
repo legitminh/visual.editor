@@ -103,7 +103,8 @@ export class InputController {
       if (event.kind !== 'touch' && !(event.buttons & 3) && event.pressure === 0) { this.interrupt(); return; }
       this.handlers.strokeMove?.(this.smoothed(event));
     } else if (event.phase === 'up') {
-      const point = this.smoothed({ ...event, pressure: this.stroke.pressure });
+      // Like Krita's stabiliser, the stroke finishes exactly where the pointer was released.
+      const point = { x: event.x, y: event.y, pressure: this.stroke.pressure, time: event.time, kind: this.stroke.kind };
       this.stroke = undefined; this.handlers.strokeEnd?.(point);
     } else this.interrupt();
   }
@@ -144,7 +145,7 @@ export class InputController {
     }
     this.touches.delete(event.id);
     if (this.stroke?.id === event.id) {
-      if (event.phase === 'up') { const point = this.smoothed(event); this.stroke = undefined; this.handlers.strokeEnd?.(point); }
+      if (event.phase === 'up') { const point = { x: event.x, y: event.y, pressure: this.stroke.pressure, time: now, kind: this.stroke.kind }; this.stroke = undefined; this.handlers.strokeEnd?.(point); }
       else this.interrupt(false);
     }
     if (this.pinchStart && this.touches.size < 2) { this.pinchStart = undefined; this.handlers.pinch?.('end', 1, event.x, event.y); }

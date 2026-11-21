@@ -58,7 +58,9 @@ export class VisualEditor {
   private stroke?: { layer: Layer; raster?: RasterStroke; vector?: VectorStroke; erased?: Set<string>; vectorBefore?: VectorStroke[]; erase: boolean };
   private floatingState?: { recorder?: TileRecorder; vectorBefore?: VectorStroke[]; others?: VectorStroke[] };
   private listeners = new Set<(change: EditorChange) => void>();
-  private savedMain = '';
+  private savedSignature = '';
+  /** When false (flat images), tool/colour choices do not make the document dirty. */
+  persistState = true;
   private names: Set<string>;
 
   private constructor(public doc: VisualDocument, public base: string, existing: Iterable<string> = []) {
@@ -73,7 +75,7 @@ export class VisualEditor {
     editor.layers = await Promise.all(editor.doc.layers.map((entry) => editor.loadLayer(entry, io)));
     editor.activeLayerId = (editor.layers[editor.doc.state.layer ?? editor.layers.length - 1] ?? editor.layers.at(-1))?.id ?? '';
     if (!editor.layers.length) editor.addLayerInternal('raster', 'Layer 1');
-    editor.savedMain = editor.serialize();
+    editor.savedSignature = editor.signature();
     return editor;
   }
 
@@ -81,13 +83,14 @@ export class VisualEditor {
   static create(base: string, width: number, height: number, existing: Iterable<string> = []) {
     const editor = new VisualEditor(defaultDocument(width, height), base, existing);
     editor.addLayerInternal('raster', 'Layer 1');
-    editor.savedMain = '';
+    editor.savedSignature = '';
     return editor;
   }
 
   /** Wrap flat images (PNG/JPEG/HEIC/ORA layers) as an in-memory document; layer files are never written. */
   static fromImages(base: string, width: number, height: number, images: { name: string; visible: boolean; opacity: number; image: RGBAImage; x?: number; y?: number }[]) {
     const editor = new VisualEditor(defaultDocument(width, height), base);
+    editor.persistState = false;
     for (const item of images) {
       const raster = new TiledSurface();
       raster.write(item.x ?? 0, item.y ?? 0, item.image);
@@ -96,7 +99,7 @@ export class VisualEditor {
     }
     if (!editor.layers.length) editor.addLayerInternal('raster', 'Layer 1');
     editor.activeLayerId = editor.layers.at(-1)!.id;
-    editor.savedMain = editor.serialize();
+    editor.savedSignature = editor.signature();
     return editor;
   }
 
@@ -401,7 +404,10 @@ export class VisualEditor {
   }
   layerVersion(layer: Layer) { return layer.raster?.version ?? layer.vector?.version ?? 0; }
   isLayerDirty(layer: Layer) { return !layer.missing && this.layerVersion(layer) !== layer.savedVersion; }
-  get dirty() { return this.layers.some((layer) => this.isLayerDirty(layer)) || this.serialize() !== this.savedMain; }
+  private signature() {
+    return this.persistState ? this.serialize() : JSON.stringify(this.layers.map((layer) => [layer.id, layer.entry]));
+  }
+  get dirty() { return this.layers.some((layer) => this.isLayerDirty(layer)) || this.signature() !== this.savedSignature; }
 
   /**
    * Produce the main text plus every changed layer file. Raster layers are cropped to their content,
@@ -427,7 +433,7 @@ export class VisualEditor {
   }
   markSaved(result: { main: string; versions: Map<string, number> }) {
     for (const layer of this.layers) { const version = result.versions.get(layer.id); if (version !== undefined) layer.savedVersion = version; }
-    this.savedMain = result.main;
+    this.savedSignature = this.persistState ? result.main : this.signature();
     this.emit('state');
   }
 
