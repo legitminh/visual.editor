@@ -40,10 +40,12 @@ export interface InputOptions {
   palmMs: number;
   tapMs: number;
   tapSlop: number;
+  /** Recognise two/three-finger taps from pointer events. Hosts that read touch events themselves can turn this off. */
+  taps: boolean;
 }
 
 export class InputController {
-  options: InputOptions = { stylusOnly: false, panMode: false, smoothing: 0, palmMs: 500, tapMs: 300, tapSlop: 10 };
+  options: InputOptions = { stylusOnly: false, panMode: false, smoothing: 0, palmMs: 500, tapMs: 300, tapSlop: 10, taps: true };
   private stroke?: { id: number; kind: PointerKind; x: number; y: number; pressure: number; rawX: number; rawY: number };
   private panPointer?: { id: number; x: number; y: number };
   private touches = new Map<number, { x: number; y: number; startX: number; startY: number }>();
@@ -153,7 +155,7 @@ export class InputController {
     if (this.pinchStart && this.touches.size < 2) { this.pinchStart = undefined; this.handlers.pinch?.('end', 1, event.x, event.y); }
     if (!this.touches.size && this.tap) {
       const tap = this.tap; this.tap = undefined;
-      if (event.phase === 'up' && !tap.moved && now - tap.start < this.options.tapMs && now - this.lastPen >= this.options.palmMs) {
+      if (this.options.taps && event.phase === 'up' && !tap.moved && now - tap.start < this.options.tapMs && now - this.lastPen >= this.options.palmMs) {
         if (tap.max === 2) this.handlers.undo?.(); else if (tap.max === 3) this.handlers.redo?.();
       }
     }
