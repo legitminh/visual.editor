@@ -5,8 +5,9 @@ import { defaultDocument, parseDocument, serializeDocument, type EditorState, ty
 import { compound, History, type HistoryCommand } from './history';
 import { parseColor, polygonMask, RasterStroke, type ClipMask } from './raster/paint';
 import { clearMasked, extractMasked, stampImage } from './raster/selection';
-import { TiledSurface, TileRecorder, type Rect, type RGBAImage } from './raster/surface';
-import { appendPoint, hitsStroke, isVectorFile, newStroke, parseVector, pointInPolygon, replaceStrokes, serializeVector, strokeBounds, transformStroke, VectorLayerData, type VectorStroke } from './vector/vector';
+import { TiledSurface, TileRecorder, unionRect, type Rect, type RGBAImage } from './raster/surface';
+import { applyMatrix, isConvex, quadBounds, rectQuad, rectToQuad, warpImage, type Matrix3, type Quad } from './transform/homography';
+import { appendPoint, hitsStroke, isVectorFile, newStroke, parseVector, pointInPolygon, replaceStrokes, serializeVector, strokeBounds, VectorLayerData, type VectorStroke } from './vector/vector';
 
 export interface Layer {
   id: string;
@@ -31,7 +32,17 @@ export interface Selection {
   clip?: ClipMask;
   strokeIds?: Set<string>;
 }
-export interface Floating { from: Rect; box: Rect; image?: RGBAImage; strokes?: VectorStroke[] }
+export interface TransformTarget {
+  layer: Layer;
+  /** Source rectangle of this layer's lifted content. */
+  rect: Rect;
+  image?: RGBAImage;
+  recorder?: TileRecorder;
+  strokes?: VectorStroke[];
+  others?: VectorStroke[];
+  before?: VectorStroke[];
+}
+export interface TransformSession { from: Rect; quad: Quad; targets: TransformTarget[]; allLayers: boolean; version: number }
 
 export interface SavedFile { name: string; data: Uint8Array | string; kind: LayerKind }
 export interface SaveResult { main: string; files: SavedFile[] }
@@ -54,9 +65,8 @@ export class VisualEditor {
   readonly brushes = new Map<string, Brush>();
   activeLayerId = '';
   selection?: Selection;
-  floating?: Floating;
+  transform?: TransformSession;
   private stroke?: { layer: Layer; raster?: RasterStroke; vector?: VectorStroke; erased?: Set<string>; vectorBefore?: VectorStroke[]; erase: boolean };
-  private floatingState?: { recorder?: TileRecorder; vectorBefore?: VectorStroke[]; others?: VectorStroke[] };
   private listeners = new Set<(change: EditorChange) => void>();
   private savedSignature = '';
   /** When false (flat images), tool/colour choices do not make the document dirty. */
@@ -144,9 +154,9 @@ export class VisualEditor {
   get state() { return this.doc.state; }
   get activeLayer() { return this.layers.find((layer) => layer.id === this.activeLayerId) ?? this.layers.at(-1); }
   get missingLayers() { return this.layers.filter((layer) => layer.missing); }
-  get canUndo() { return this.history.canUndo && !this.stroke && !this.floating; }
-  get canRedo() { return this.history.canRedo && !this.stroke && !this.floating; }
-  get busy() { return !!this.stroke || !!this.floating; }
+  get canUndo() { return this.history.canUndo && !this.stroke && !this.transform; }
+  get canRedo() { return this.history.canRedo && !this.stroke && !this.transform; }
+  get busy() { return !!this.stroke || !!this.transform; }
   layer(id: string) { return this.layers.find((layer) => layer.id === id); }
 
   /** Resolve a brush reference; falls back to the built-in Krita basic presets. */
@@ -265,8 +275,9 @@ export class VisualEditor {
       if (clip) this.selection = { layerId: layer.id, path, rect: clip.rect, clip };
     } else if (layer.vector) {
       const ids = new Set(layer.vector.strokes.filter((stroke) => {
-        for (let i = 0; i < stroke.points.length; i += 3) if (pointInPolygon(stroke.points[i], stroke.points[i + 1], path)) return true;
-        return false;
+        // Only strokes entirely inside the lasso are selected.
+        for (let i = 0; i < stroke.points.length; i += 3) if (!pointInPolygon(stroke.points[i], stroke.points[i + 1], path)) return false;
+        return stroke.points.length > 0;
       }).map((stroke) => stroke.id));
       if (ids.size) {
         const rect = layer.vector.strokes.filter((stroke) => ids.has(stroke.id)).map(strokeBounds).reduce((a, b) => unite(a, b));
@@ -286,54 +297,126 @@ export class VisualEditor {
     if (layer.vector && selection.strokeIds) return this.record(replaceStrokes(layer.vector, layer.vector.strokes.filter((stroke) => !selection.strokeIds!.has(stroke.id)), 'delete strokes'), 'content', 'selection');
     return false;
   }
-  /** Lift the selection so it can be moved/resized; preview via `floating`. */
-  beginTransform() {
-    const selection = this.selection, layer = selection && this.layer(selection.layerId);
-    if (!selection || !layer || this.busy) return false;
-    if (layer.raster && selection.clip) {
-      const image = extractMasked(layer.raster, selection.clip);
-      const recorder = clearMasked(layer.raster, selection.clip);
-      this.floating = { from: { ...selection.rect }, box: { ...selection.rect }, image };
-      this.floatingState = { recorder };
-    } else if (layer.vector && selection.strokeIds) {
-      const before = layer.vector.strokes;
-      const strokes = before.filter((stroke) => selection.strokeIds!.has(stroke.id));
-      this.floating = { from: { ...selection.rect }, box: { ...selection.rect }, strokes };
-      this.floatingState = { vectorBefore: before, others: before.filter((stroke) => !selection.strokeIds!.has(stroke.id)) };
-    } else return false;
+  // ---------------------------------------------------------------- transform
+  /**
+   * Begin a transform session. With a lasso selection only the selected pixels (raster) or the strokes
+   * fully inside it (vector) move; otherwise whole layers do. `allLayers` applies it to every editable
+   * layer instead of just the active one. The session's quad is edited freely (move, corner stretch/shear,
+   * edge scale, rotate, scale) and committed as one undo step.
+   */
+  beginTransformSession(allLayers = false) {
+    if (this.busy) return false;
+    const selection = this.selection;
+    const selectionLayer = selection && this.layer(selection.layerId);
+    const layers = allLayers ? this.layers.filter((layer) => !layer.missing && !layer.entry.locked && layer.entry.visible)
+      : [selectionLayer ?? this.activeLayer].filter((layer): layer is Layer => !!layer && !layer.missing && !layer.entry.locked);
+    const targets: TransformTarget[] = [];
+    let from: Rect | undefined;
+    for (const layer of layers) {
+      if (layer.raster) {
+        let clip: ClipMask | undefined;
+        if (selection?.clip && layer.id === selection.layerId) clip = selection.clip;
+        else if (selection) clip = polygonMask(selection.path);
+        else {
+          const bounds = layer.raster.bounds();
+          if (bounds) clip = { rect: bounds, mask: new Uint8Array(bounds.width * bounds.height).fill(255) };
+        }
+        if (!clip) continue;
+        const image = extractMasked(layer.raster, clip);
+        if (!image.data.some((value, index) => index % 4 === 3 && value > 0)) continue;
+        const recorder = clearMasked(layer.raster, clip);
+        targets.push({ layer, rect: clip.rect, image, recorder });
+        from = unionRect(from, clip.rect);
+      } else if (layer.vector) {
+        const before = layer.vector.strokes;
+        const inside = (stroke: VectorStroke) => {
+          if (!selection) return true;
+          for (let i = 0; i < stroke.points.length; i += 3) if (!pointInPolygon(stroke.points[i], stroke.points[i + 1], selection.path)) return false;
+          return true;
+        };
+        const strokes = before.filter(inside);
+        if (!strokes.length) continue;
+        const rect = strokes.map(strokeBounds).reduce((a, b) => unite(a, b));
+        targets.push({ layer, rect, strokes, before, others: before.filter((stroke) => !inside(stroke)) });
+        from = unionRect(from, rect);
+      }
+    }
+    if (!targets.length || !from) return false;
+    this.transform = { from, quad: rectQuad(from), targets, allLayers, version: 0 };
     this.emit('selection', 'content');
     return true;
   }
-  setTransform(box: Rect) {
-    const floating = this.floating, layer = this.selection && this.layer(this.selection.layerId);
-    if (!floating || !layer) return;
-    floating.box = { ...box, width: Math.max(1, box.width), height: Math.max(1, box.height) };
-    if (layer.vector && floating.strokes) {
-      layer.vector.strokes = [...this.floatingState!.others!, ...floating.strokes.map((stroke) => transformStroke(stroke, floating.from, floating.box))];
-      layer.vector.touch();
+  /** Replace the session's corner quad. Self-intersecting quads are rejected. */
+  setTransformQuad(quad: Quad) {
+    const session = this.transform;
+    if (!session || !isConvex(quad)) return false;
+    session.quad = quad.map((p) => [p[0], p[1]]) as Quad; session.version++;
+    const matrix = rectToQuad(session.from, session.quad), scale = Math.sqrt(Math.abs(quadArea(session.quad) / Math.max(1e-9, session.from.width * session.from.height)));
+    for (const target of session.targets) {
+      if (!target.strokes || !target.layer.vector) continue;
+      target.layer.vector.strokes = [...target.others!, ...target.strokes.map((stroke) => mapStroke(stroke, matrix, scale))];
+      target.layer.vector.touch();
+    }
+    this.emit('selection', 'content');
+    return true;
+  }
+  /** True when transformed content would extend past the canvas edges. */
+  transformOutsideCanvas() {
+    const session = this.transform;
+    if (!session) return false;
+    const box = quadBounds(session.quad);
+    return box.x < 0 || box.y < 0 || box.x + box.width > this.width || box.y + box.height > this.height;
+  }
+  /** Commit as one undoable step. `keepOutside: false` crops transformed content to the canvas. */
+  commitTransformSession(keepOutside = true) {
+    const session = this.transform;
+    if (!session) return false;
+    this.transform = undefined;
+    const canvas = { x: 0, y: 0, width: this.width, height: this.height };
+    const commands: HistoryCommand[] = [];
+    const matrix = rectToQuad(session.from, session.quad), scale = Math.sqrt(Math.abs(quadArea(session.quad) / Math.max(1e-9, session.from.width * session.from.height)));
+    for (const target of session.targets) {
+      if (target.image && target.recorder && target.layer.raster) {
+        const warped = warpImage(target.image, target.rect, targetQuad(matrix, target.rect), keepOutside ? undefined : canvas);
+        if (warped) stampImage(target.layer.raster, warped.image, warped.rect, target.recorder);
+        const command = target.recorder.command('transform');
+        if (command) commands.push(command);
+      } else if (target.strokes && target.layer.vector) {
+        const vector = target.layer.vector;
+        let moved = target.strokes.map((stroke) => mapStroke(stroke, matrix, scale));
+        if (!keepOutside) moved = moved.filter((stroke) => intersects(strokeBounds(stroke), canvas));
+        vector.strokes = target.before!;
+        commands.push(replaceStrokes(vector, [...target.others!, ...moved], 'transform strokes'));
+      }
+    }
+    this.selection = undefined;
+    if (!commands.length) { this.emit('selection', 'content'); return false; }
+    return this.record(compound('transform', commands), 'content', 'selection');
+  }
+  cancelTransformSession() {
+    const session = this.transform;
+    if (!session) return;
+    this.transform = undefined;
+    for (const target of session.targets) {
+      target.recorder?.restore();
+      if (target.before && target.layer.vector) { target.layer.vector.strokes = target.before; target.layer.vector.touch(); }
     }
     this.emit('selection', 'content');
   }
-  commitTransform() {
-    const floating = this.floating, state = this.floatingState, layer = this.selection && this.layer(this.selection.layerId);
-    this.floating = undefined; this.floatingState = undefined; this.selection = undefined;
-    if (!floating || !state || !layer) return false;
-    if (layer.raster && floating.image && state.recorder) {
-      stampImage(layer.raster, floating.image, floating.box, state.recorder);
-      return this.record(state.recorder.command('transform selection'), 'content', 'selection');
-    }
-    const vector = layer.vector!, after = vector.strokes;
-    vector.strokes = state.vectorBefore!;
-    return this.record(replaceStrokes(vector, after, 'transform strokes'), 'content', 'selection');
+  /** Target corner quad for a sub-rectangle of the session (used to warp each layer's pixels). */
+  transformQuadFor(rect: Rect): Quad | undefined {
+    const session = this.transform;
+    return session && targetQuad(rectToQuad(session.from, session.quad), rect);
   }
-  cancelTransform() {
-    const state = this.floatingState, layer = this.selection && this.layer(this.selection.layerId);
-    this.floating = undefined; this.floatingState = undefined;
-    if (!state || !layer) return;
-    if (state.recorder) state.recorder.restore();
-    if (state.vectorBefore && layer.vector) { layer.vector.strokes = state.vectorBefore; layer.vector.touch(); }
-    this.emit('selection', 'content');
-  }
+
+  // Rectangle move/resize of the lasso selection, expressed as a transform session.
+  /** Lift the selection so it can be moved/resized; preview via `transform`. */
+  beginTransform() { return !!this.selection && this.beginTransformSession(false); }
+  setTransform(box: Rect) { this.setTransformQuad(rectQuad({ ...box, width: Math.max(1, box.width), height: Math.max(1, box.height) })); }
+  commitTransform() { return this.commitTransformSession(true); }
+  cancelTransform() { this.cancelTransformSession(); }
+  /** Bounding box of the transformed content while a session is active. */
+  get floating() { const session = this.transform; return session ? { from: session.from, box: quadBounds(session.quad) } : undefined; }
 
   // ---------------------------------------------------------------- layers
   /** A filename for a new layer asset, unique among known files. */
@@ -415,7 +498,7 @@ export class VisualEditor {
    */
   async save(): Promise<SaveResult & { versions: Map<string, number> }> {
     if (this.stroke) this.endStroke();
-    if (this.floating) this.commitTransform();
+    if (this.transform) this.commitTransformSession(true);
     const files: SavedFile[] = [], versions = new Map<string, number>();
     for (const layer of this.layers) {
       if (!this.isLayerDirty(layer)) continue;
@@ -468,6 +551,14 @@ export class VisualEditor {
   }
 }
 
+const quadArea = (q: Quad) => Math.abs(q.reduce((sum, p, i) => { const n = q[(i + 1) % 4]; return sum + p[0] * n[1] - n[0] * p[1]; }, 0)) / 2;
+const intersects = (a: Rect, b: Rect) => a.x < b.x + b.width && a.x + a.width > b.x && a.y < b.y + b.height && a.y + a.height > b.y;
+const targetQuad = (matrix: Matrix3, rect: Rect): Quad => rectQuad(rect).map(([x, y]) => applyMatrix(matrix, x, y)) as Quad;
+function mapStroke(stroke: VectorStroke, matrix: Matrix3, scale: number): VectorStroke {
+  const points = stroke.points.slice();
+  for (let i = 0; i < points.length; i += 3) { const [x, y] = applyMatrix(matrix, points[i], points[i + 1]); points[i] = Math.round(x * 100) / 100; points[i + 1] = Math.round(y * 100) / 100; }
+  return { ...stroke, points, size: Math.max(0.25, stroke.size * scale) };
+}
 const unite = (a: Rect, b: Rect): Rect => {
   const x = Math.min(a.x, b.x), y = Math.min(a.y, b.y);
   return { x, y, width: Math.max(a.x + a.width, b.x + b.width) - x, height: Math.max(a.y + a.height, b.y + b.height) - y };

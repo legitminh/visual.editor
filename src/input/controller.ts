@@ -86,12 +86,13 @@ export class InputController {
   }
 
   private single(event: RawPointer) {
-    const middle = event.button === 1 || (event.buttons & 4) !== 0;
+    // Middle or right button pans.
+    const middle = event.button === 1 || event.button === 2 || (event.phase === 'down' && (event.buttons & 6) !== 0);
     if (event.phase === 'down') {
       if (this.stroke && this.stroke.id !== event.id) this.interrupt();
       if (event.kind === 'pen' && this.stroke?.kind === 'touch') this.interrupt(false);
       if (middle || this.options.panMode) { this.panPointer = { id: event.id, x: event.x, y: event.y }; return; }
-      if (event.button !== undefined && event.button > 1) return;
+      if (event.button !== undefined && event.button > 2) return;
       this.stroke = { id: event.id, kind: event.kind, x: event.x, y: event.y, rawX: event.x, rawY: event.y, pressure: this.normalisedPressure(event) };
       this.handlers.strokeBegin?.({ x: event.x, y: event.y, pressure: this.stroke.pressure, time: event.time, kind: event.kind });
       return;

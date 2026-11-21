@@ -167,3 +167,54 @@ test('input: two-finger tap undoes, three-finger tap redoes, palm touches after 
 });
 
 test('TILE is 128 so renderer and history agree', () => assert.equal(TILE, 128));
+
+test('vector lasso selects only strokes fully inside and moves them', () => {
+  const editor = VisualEditor.create('v', 300, 200);
+  const layer = editor.addLayer('vector', 'Ink')!;
+  editor.beginStroke(20, 20, 1, 'brush'); editor.strokeTo(60, 20, 1); editor.endStroke();   // fully inside
+  editor.beginStroke(80, 20, 1, 'brush'); editor.strokeTo(200, 20, 1); editor.endStroke();  // crosses the lasso
+  const selection = editor.lasso([[0, 0], [100, 0], [100, 50], [0, 50]]);
+  assert.equal(selection?.strokeIds?.size, 1);
+  assert.ok(editor.beginTransform());
+  editor.setTransform({ x: selection!.rect.x + 100, y: selection!.rect.y + 100, width: selection!.rect.width, height: selection!.rect.height });
+  editor.commitTransform();
+  const [moved, other] = layer.vector!.strokes.slice().sort((a, b) => b.points[1] - a.points[1]);
+  assert.ok(Math.abs(moved.points[1] - 120) < 0.5 && Math.abs(other.points[1] - 20) < 0.5);
+  editor.undo();
+  assert.ok(layer.vector!.strokes.every((stroke) => Math.abs(stroke.points[1] - 20) < 0.5));
+});
+
+test('transform sessions rotate, shear and crop or keep off-canvas content; all-layers moves every layer', async () => {
+  const { rotateQuad, moveCorner, translateQuad } = await import('../src/index');
+  const editor = VisualEditor.create('t', 200, 200), surface = editor.activeLayer!.raster!;
+  surface.write(20, 90, { width: 160, height: 20, data: new Uint8ClampedArray(160 * 20 * 4).fill(255) }); // horizontal bar
+  assert.ok(editor.beginTransformSession());
+  editor.setTransformQuad(rotateQuad(editor.transform!.quad, Math.PI / 2));
+  assert.equal(editor.transformOutsideCanvas(), false);
+  editor.commitTransformSession();
+  assert.equal(alphaAt(surface, 100, 30), 255, 'bar is vertical after rotating');
+  assert.equal(alphaAt(surface, 30, 100), 0);
+  editor.undo(); assert.equal(alphaAt(surface, 30, 100), 255);
+  // Perspective: pull one corner out; the quad stays convex.
+  editor.beginTransformSession();
+  const q = editor.transform!.quad;
+  assert.ok(editor.setTransformQuad(moveCorner(q, 2, [q[2][0] + 30, q[2][1] + 40])));
+  assert.equal(editor.setTransformQuad(moveCorner(q, 2, [q[0][0] - 10, q[0][1] - 10])), false, 'self-intersecting quads are rejected');
+  editor.cancelTransformSession(); assert.equal(alphaAt(surface, 30, 100), 255);
+  // Move half the bar past the right edge and crop it.
+  editor.beginTransformSession(); editor.setTransformQuad(translateQuad(editor.transform!.quad, 100, 0));
+  assert.equal(editor.transformOutsideCanvas(), true);
+  editor.commitTransformSession(false);
+  assert.equal(surface.bounds()!.x + surface.bounds()!.width, 200, 'cropped to the canvas');
+  editor.undo();
+  editor.beginTransformSession(); editor.setTransformQuad(translateQuad(editor.transform!.quad, 100, 0)); editor.commitTransformSession(true);
+  assert.equal(surface.bounds()!.x + surface.bounds()!.width, 280, 'kept outside the canvas');
+  editor.undo();
+  // All layers.
+  const top = editor.addLayer('raster', 'Top')!;
+  top.raster!.write(0, 0, { width: 10, height: 10, data: new Uint8ClampedArray(400).fill(255) });
+  assert.ok(editor.beginTransformSession(true));
+  assert.equal(editor.transform!.targets.length, 2);
+  editor.setTransformQuad(translateQuad(editor.transform!.quad, 0, 50)); editor.commitTransformSession();
+  assert.equal(alphaAt(top.raster!, 5, 55), 255); assert.equal(alphaAt(surface, 100, 145), 255);
+});

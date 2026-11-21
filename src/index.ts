@@ -11,5 +11,6 @@ export * from './brush/presets';
 export * from './codec/png';
 export * from './input/view';
 export * from './input/controller';
+export * from './transform/homography';
 export * from './editor';
 export * from './render/canvas2d';

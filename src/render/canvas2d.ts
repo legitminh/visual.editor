@@ -1,6 +1,7 @@
-import type { Layer, VisualEditor } from '../editor';
+import type { Layer, TransformTarget, VisualEditor } from '../editor';
+import { warpImage } from '../transform/homography';
 import type { ViewTransform } from '../input/view';
-import { TILE, tileX, tileY, unionRect, type Rect } from '../raster/surface';
+import { TILE, tileX, tileY, unionRect, type Rect, type RGBAImage } from '../raster/surface';
 import { strokeOutline, type VectorStroke } from '../vector/vector';
 
 type Canvas2D = CanvasRenderingContext2D;
@@ -25,7 +26,8 @@ export class CanvasRenderer {
   private backings = new Map<string, Backing>();
   private paths = new WeakMap<VectorStroke, { length: number; path: Path2D }>();
   private scratch?: HTMLCanvasElement;
-  private floatingCanvas?: { canvas: HTMLCanvasElement; source: object };
+  private sources = new WeakMap<object, HTMLCanvasElement>();
+  private warped = new WeakMap<object, { version: number; canvas: HTMLCanvasElement; rect: Rect }>();
   private frame = 0;
   private checker?: CanvasPattern;
   private unsubscribe: () => void;
@@ -106,7 +108,7 @@ export class CanvasRenderer {
     context.fillRect(...docRect);
     context.setTransform(dpr * view.zoom, 0, 0, dpr * view.zoom, dpr * view.panX, dpr * view.panY);
     context.imageSmoothingEnabled = view.zoom < 2;
-    const floatingLayer = editor.floating && editor.selection?.layerId;
+    const session = editor.transform;
     for (const layer of editor.layers) {
       if (!layer.entry.visible || layer.missing) continue;
       const alpha = layer.entry.opacity;
@@ -114,7 +116,8 @@ export class CanvasRenderer {
         const backing = this.backing(layer);
         context.globalAlpha = alpha;
         context.drawImage(backing.canvas, backing.rect.x, backing.rect.y);
-        if (floatingLayer === layer.id && editor.floating?.image) this.drawFloating(context);
+        const target = session?.targets.find((item) => item.layer === layer && item.image);
+        if (target) this.drawTransformed(context, target);
       } else if (layer.vector) {
         if (alpha >= 1) this.drawVector(context, layer, 1);
         else {
@@ -135,14 +138,40 @@ export class CanvasRenderer {
     if (this.overlay) { context.setTransform(dpr * view.zoom, 0, 0, dpr * view.zoom, dpr * view.panX, dpr * view.panY); this.overlay(context, view); }
   }
 
-  private drawFloating(context: Canvas2D) {
-    const floating = this.editor.floating!, image = floating.image!;
-    if (this.floatingCanvas?.source !== image) {
-      const canvas = document.createElement('canvas'); canvas.width = image.width; canvas.height = image.height;
+  private canvasFor(image: RGBAImage) {
+    let canvas = this.sources.get(image);
+    if (!canvas) {
+      canvas = document.createElement('canvas'); canvas.width = image.width; canvas.height = image.height;
       canvas.getContext('2d')!.putImageData(new ImageData(image.data as Uint8ClampedArray<ArrayBuffer>, image.width, image.height), 0, 0);
-      this.floatingCanvas = { canvas, source: image };
+      this.sources.set(image, canvas);
     }
-    context.drawImage(this.floatingCanvas.canvas, floating.box.x, floating.box.y, floating.box.width, floating.box.height);
+    return canvas;
+  }
+
+  /** Lifted pixels under the session transform: GPU for affine quads, CPU warp for perspective. */
+  private drawTransformed(context: Canvas2D, target: TransformTarget) {
+    const session = this.editor.transform!, quad = this.editor.transformQuadFor(target.rect)!, image = target.image!, r = target.rect;
+    const [q0, q1, q2, q3] = quad;
+    const affine = Math.abs(q0[0] + q2[0] - q1[0] - q3[0]) < 0.01 && Math.abs(q0[1] + q2[1] - q1[1] - q3[1]) < 0.01;
+    if (affine) {
+      const a = (q1[0] - q0[0]) / r.width, b = (q1[1] - q0[1]) / r.width, c = (q3[0] - q0[0]) / r.height, d = (q3[1] - q0[1]) / r.height;
+      context.save();
+      context.transform(a, b, c, d, q0[0] - a * r.x - c * r.y, q0[1] - b * r.x - d * r.y);
+      context.drawImage(this.canvasFor(image), r.x, r.y);
+      context.restore();
+      return;
+    }
+    let cached = this.warped.get(target);
+    if (!cached || cached.version !== session.version) {
+      const result = warpImage(image, r, quad);
+      if (!result) return;
+      const canvas = cached?.canvas ?? document.createElement('canvas');
+      canvas.width = result.image.width; canvas.height = result.image.height;
+      canvas.getContext('2d')!.putImageData(new ImageData(result.image.data as Uint8ClampedArray<ArrayBuffer>, result.image.width, result.image.height), 0, 0);
+      cached = { version: session.version, canvas, rect: result.rect };
+      this.warped.set(target, cached);
+    }
+    context.drawImage(cached.canvas, cached.rect.x, cached.rect.y);
   }
 
   private makeChecker() {
