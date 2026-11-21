@@ -1,0 +1,22 @@
+{
+  "name": "visual.editor",
+  "version": "0.1.0",
+  "description": "Cross-platform layered raster + vector image editing engine with a plaintext document model.",
+  "license": "MIT",
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": { "types": "./src/index.ts", "default": "./src/index.ts" }
+  },
+  "files": ["src"],
+  "scripts": {
+    "check": "tsc --noEmit -p tsconfig.json",
+    "test": "node --import tsx --test test/*.test.ts"
+  },
+  "repository": { "type": "git", "url": "https://github.com/legitminh/visual.editor.git" },
+  "devDependencies": {
+    "tsx": "^4.20.0",
+    "typescript": "^6.0.3",
+    "@types/node": "^24"
+  }
+}

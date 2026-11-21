@@ -1,0 +1,7 @@
+<!doctype html>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>visual.editor demo</title>
+<style>html,body{margin:0;height:100%;font:14px system-ui}body{display:flex;flex-direction:column}nav{display:flex;gap:8px;padding:8px}#stage{flex:1;width:100%;touch-action:none;background:#d0d4da}</style>
+<nav><button id="tool">brush</button><select id="brushes"></select><input id="color" type="color" value="#202733"><button id="undo">undo</button><button id="redo">redo</button><button id="vector">+ vector layer</button></nav>
+<canvas id="stage"></canvas>
+<script type="module" src="./main.js"></script>
