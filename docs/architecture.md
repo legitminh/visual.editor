@@ -56,6 +56,14 @@ Measured on one CPU core in Node: 38 µs per input sample with an 8 px brush and
 
 Strokes store their samples and brush parameters. The outline is drawn as consistently wound circles plus tangent quads filled with the nonzero rule, so translucent strokes don't darken where they overlap themselves. The eraser removes whole strokes. Lasso selects whole strokes, which can then be moved, scaled or deleted.
 
+## Transform (`src/transform`)
+
+`beginTransformSession(allLayers)` lifts the content to transform. That is the lasso-selected pixels, or the vector strokes lying entirely inside the lasso; with no selection it is the whole active layer, and with `allLayers` it is every editable layer. The session keeps a corner quad. Helpers edit that quad and `setTransformQuad` applies the result: `translateQuad`, `moveCorner` (stretch/shear, which gives a projective map), `moveEdge` (scale along one axis), `rotateQuad` and `scaleQuad`. Self-intersecting quads are rejected.
+
+* **Raster pixels** are warped through the inverse homography with bilinear sampling. The renderer previews affine quads on the GPU (`setTransform`) and uses a cached CPU warp for perspective quads.
+* **Vector strokes** are mapped point by point, with stroke width scaled by the quad's area ratio.
+* `transformOutsideCanvas()` reports content past the canvas edges. `commitTransformSession(keepOutside)` either keeps that content (layers are unbounded) or crops it to the canvas. The whole session is one undo step.
+
 ## Brushes (`src/brush`)
 
 * The engine's brush is a Krita-style pixel brush with a generated tip: size, minimum size, pressure for size, opacity and flow, hardness, spacing, ratio, angle, smoothing, pressure gamma and eraser mode. It is stored in `.vbrush` files using the same plaintext syntax (`\visual_brush[…]`).
